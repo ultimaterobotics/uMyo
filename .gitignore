@@ -34,7 +34,7 @@
 *.app
 *.i*86
 *.x86_64
-*.hex
+*.in
 
 # Debug files
 *.dSYM/
@@ -50,3 +50,4 @@ modules.order
 Module.symvers
 Mkfile.old
 dkms.conf
+*.project
