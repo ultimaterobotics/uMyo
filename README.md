@@ -1,7 +1,8 @@
 # uMyo device
 
 This repository contains firmware only, other repositories:
-* PCB design: https://github.com/ultimaterobotics/uMyo_v2_pcb
+* PCB design for v3.1: https://github.com/ultimaterobotics/uMyo_v3_1_pcb/
+* PCB design for v2: https://github.com/ultimaterobotics/uMyo_v2_pcb
 * Tools for receiving+processing data in Python: https://github.com/ultimaterobotics/uMyo_python_tools
 * Arduino library for receiving data via nRF24 radio: https://github.com/ultimaterobotics/uMyo_RF24
 * Arduino library for receiving data via ESP32 BLE: https://github.com/ultimaterobotics/uMyo_BLE
