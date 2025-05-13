@@ -13,11 +13,39 @@ uMyo is a wireless wearable EMG sensor with on-board IMU. By default it uses dry
 
 Measured data are sent via radio in 3 modes (selected via button). One is compatible with popular Arduino nRF24 radio (although that somewhat reduces amount of data which can be sent), another requires nRF5x radio but all the measured data are sent, and yet another mode uses generic BLE advertisement - which significantly limits bandwidth but still can be reasonably used with ESP32's BLE).
 
-Design and firmware are open source with permissive licenses, and also we sell assembled devices on Tindie: https://www.tindie.com/products/28529/
+Design and firmware are open source with permissive licenses, and also we sell assembled devices in our shop: https://udevices.io/products/umyo-wearable-emg-sensor
+
+## Prerequisites for building
 
 For building it requires urf_lib and arm-none-eabi compiler.
 
-Important code properties:
+* **GNU Arm Embedded Toolchain** (`arm-none-eabi-gcc`, tested with 13.2)
+* **urf_lib sub-module** – our in-house nRF52 helper library  
+  (`urf_lib` provides the BLE stack, timing, radio helpers, etc.)
+
+> **Why a sub-module?**  
+> The `urf_lib` sources live in their own repository so we can reuse them
+> across multiple projects.  
+> Git does **not** clone sub-modules automatically, so you must pull it once
+> after cloning the main repo.
+
+# first-time checkout
+git clone https://github.com/ultimaterobotics/uMyo.git
+cd uMyo
+git submodule update --init --recursive    # ← fetches urf_lib
+
+# if you already have the repo and want the newest urf_lib:
+git submodule update --remote --merge      # optional
+
+# When urf_lib is updated upstream
+cd urf_lib
+git pull origin main     # or checkout a specific tag
+cd ..
+git add urf_lib
+git commit -m "Bump urf_lib to <commit-hash>"
+
+
+## Important code properties:
  - ADC reading using DMA, FFT calculations in a way that won't interrupt data acquisition process (handled in adc_read.c)
  - IMU data integration into orientation quaternion (handled in lsm6ds3.c)
  - Filtering 50/60 Hz noise and sending data via one of 3 configurable radio interfaces (main.c, functions push_adc_data(), prepare_and_send_BLE(), prepare_data_packet32() for nRF24 mode, prepare_data_packet() for base station mode)
