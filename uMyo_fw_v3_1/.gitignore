@@ -51,7 +51,3 @@ Module.symvers
 Mkfile.old
 dkms.conf
 *.project
-
-# Firmware build artefacts
-**/build/
-*.hex *.bin
