@@ -5,8 +5,10 @@ OUTPUT_DIRECTORY := build/
 SDK_ROOT := ../urf_lib/nrf_usdk52
 PROJ_DIR := .
 
+# v3 based on nRF52832
+
 $(OUTPUT_DIRECTORY)/uMyo.out: \
-  LINKER_SCRIPT  := ../ur_device_nrf52810.ld 
+  LINKER_SCRIPT := $(SDK_ROOT)/ur_device_nrf52810.ld 
 
 # Source files common to all targets
 SRC_FILES += \
