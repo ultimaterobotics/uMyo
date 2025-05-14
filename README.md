@@ -30,31 +30,39 @@ For building it requires urf_lib and arm-none-eabi compiler.
 > after cloning the main repo.
 
 # first-time checkout
+
+```bash
 git clone https://github.com/ultimaterobotics/uMyo.git
 cd uMyo
 git submodule update --init --recursive    # ← fetches urf_lib
+```
 
 # if you already have the repo and want the newest urf_lib:
-git submodule update --remote --merge      # optional
 
+```bash
+git submodule update --remote --merge      # optional
+```
 # When urf_lib is updated upstream
+```bash
 cd urf_lib
 git pull origin main     # or checkout a specific tag
 cd ..
 git add urf_lib
 git commit -m "Bump urf_lib to <commit-hash>"
-
+```
 # Install GCC 8
 
 ```bash
 # Ubuntu / Debian
 sudo apt update
 sudo apt install gcc-arm-none-eabi=15:8-2018-q4-*
-
+```
 # Alternatively (all OSes):
+```bash
 wget -qO- https://developer.arm.com/-/media/Files/downloads/gnu-rm/8-2018-q4-major/gcc-arm-none-eabi-8-2018-q4-major-linux.tar.bz2 \
  | tar -xjC $HOME/toolchains
 export PATH=$HOME/toolchains/gcc-arm-none-eabi-8-2018-q4-major/bin:$PATH
+```
 
 ## Important code properties:
  - ADC reading using DMA, FFT calculations in a way that won't interrupt data acquisition process (handled in adc_read.c)
