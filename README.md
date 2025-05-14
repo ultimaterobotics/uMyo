@@ -15,11 +15,11 @@ Measured data are sent via radio in 3 modes (selected via button). One is compat
 
 Design and firmware are open source with permissive licenses, and also we sell assembled devices in our shop: https://udevices.io/products/umyo-wearable-emg-sensor
 
-## Prerequisites for building
+## Tool chain
 
 For building it requires urf_lib and arm-none-eabi compiler.
 
-* **GNU Arm Embedded Toolchain** (`arm-none-eabi-gcc`, tested with 13.2)
+* **GNU Arm Embedded Toolchain** (`arm-none-eabi-gcc`, tested with GNU Arm Embedded “2018-q4-major” (GCC 8.2.1))
 * **urf_lib sub-module** – our in-house nRF52 helper library  
   (`urf_lib` provides the BLE stack, timing, radio helpers, etc.)
 
@@ -44,6 +44,17 @@ cd ..
 git add urf_lib
 git commit -m "Bump urf_lib to <commit-hash>"
 
+# Install GCC 8
+
+```bash
+# Ubuntu / Debian
+sudo apt update
+sudo apt install gcc-arm-none-eabi=15:8-2018-q4-*
+
+# Alternatively (all OSes):
+wget -qO- https://developer.arm.com/-/media/Files/downloads/gnu-rm/8-2018-q4-major/gcc-arm-none-eabi-8-2018-q4-major-linux.tar.bz2 \
+ | tar -xjC $HOME/toolchains
+export PATH=$HOME/toolchains/gcc-arm-none-eabi-8-2018-q4-major/bin:$PATH
 
 ## Important code properties:
  - ADC reading using DMA, FFT calculations in a way that won't interrupt data acquisition process (handled in adc_read.c)
