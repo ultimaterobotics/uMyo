@@ -8,7 +8,7 @@ PROJ_DIR := .
 # v3 based on nRF52832
 
 $(OUTPUT_DIRECTORY)/uMyo.out: \
-  LINKER_SCRIPT  := ../ur_device_nrf52.ld 
+  LINKER_SCRIPT := $(SDK_ROOT)/ur_device_nrf52.ld
 
 # Source files common to all targets
 SRC_FILES += \

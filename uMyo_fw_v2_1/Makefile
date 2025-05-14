@@ -2,11 +2,11 @@ PROJECT_NAME     := uMyo
 TARGETS          := uMyo
 OUTPUT_DIRECTORY := build/
 
-SDK_ROOT := ../urf_lib/nrf_usdk52
+SDK_ROOT := urf_lib/nrf_usdk52
 PROJ_DIR := .
 
 $(OUTPUT_DIRECTORY)/uMyo.out: \
-  LINKER_SCRIPT  := ../ur_device_nrf52810.ld 
+  LINKER_SCRIPT  := ../urf_lib/ur_device_nrf52810.ld 
 
 # Source files common to all targets
 SRC_FILES += \
