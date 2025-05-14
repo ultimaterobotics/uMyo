@@ -18,16 +18,6 @@
 #include "lsm6ds3.h"
 #include "persistent_storage.h"
 
-extern uint32_t __StackLimit, __StackTop;      // symbols from nrf52_common.ld
-
-static void paint_stack(void)
-{
-    for (uint32_t *p = &__StackLimit; p < &__StackTop; p++)
-    {
-        *p = 0xDEADBEEF;   // fill stack with a known pattern
-    }
-}
-
 uint8_t pin_button = 19;
 uint8_t pin_syson = 4; 
 
@@ -710,7 +700,6 @@ void process_btn_read()
 
 int main(void)
 {
-	paint_stack(); 
 	NRF_GPIO->DIRSET = 1<<pin_syson;
 	NRF_GPIO->OUTSET = 1<<pin_syson;
 	NRF_WDT->CRV = 1*32768; //1 second timeout
