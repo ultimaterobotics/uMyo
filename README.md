@@ -62,3 +62,21 @@ export PATH=$HOME/toolchains/gcc-arm-none-eabi-8-2018-q4-major/bin:$PATH
  - ADC reading using DMA, FFT calculations in a way that won't interrupt data acquisition process (handled in adc_read.c)
  - IMU data integration into orientation quaternion (handled in lsm6ds3.c)
  - Filtering 50/60 Hz noise and sending data via one of 3 configurable radio interfaces (main.c, functions push_adc_data(), prepare_and_send_BLE(), prepare_data_packet32() for nRF24 mode, prepare_data_packet() for base station mode)
+
+### RGB LED pin mapping (v3.1)
+
+Some uMyo v3.1 PCB batches have different RGB channel wiring.
+
+The firmware uses `uMyo_fw_v3_1/umyo_config.h` to define which GPIO pins are used for **R/G/B**.  
+Default mapping matches the **April 2025+ (“RGB_update”) boards**:
+
+- R = P0.06  
+- G = P0.07  
+- B = P0.08  
+
+If your RGB colors are swapped, edit these defines in `umyo_config.h`:
+
+```c
+#define UMYO_LED_PIN_R 8
+#define UMYO_LED_PIN_G 7
+#define UMYO_LED_PIN_B 6
