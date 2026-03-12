@@ -67,7 +67,7 @@ static volatile uint8_t ble_services_ready = 0;
 static int umyo_build_telem_payload(uint8_t *out, int max_len);
 static void umyo_get_ble_mac(uint8_t *mac);
 static void umyo_ble_fill_services(void);
-static int umyo_ble_conn_tick(void);
+static int umyo_ble_conn_tick(uint32_t now_ms);
 
 typedef enum
 {
@@ -105,6 +105,9 @@ volatile uint32_t dbg_ret_s1_need_more = 0;
 volatile uint32_t dbg_ret_old_need_more = 0;
 volatile uint32_t dbg_s1_packets = 0;
 volatile uint32_t dbg_old_packets = 0;
+
+volatile uint32_t dbg_aux_packets_sent = 0;
+static uint32_t g_last_aux_send_ms = 0;
 
 enum param_sends
 {
@@ -462,7 +465,57 @@ static void dbg_dump_ble_phone_state(void)
            (unsigned)g_phone_profile);
 }
 
-static int umyo_ble_conn_tick(void)
+static int build_aux26_payload(uint8_t *out, int max_len)
+{
+    int16_t ax, ay, az, gx, gy, gz;
+    int16_t mx, my, mz;
+    int16_t qww, qwx, qwy, qwz;
+
+    if (max_len < 26)
+        return 0;
+
+    lsm_get_quat_packed(&qww, &qwx, &qwy, &qwz);
+    lsm_get_acc(&ax, &ay, &az);
+    lsm_get_W(&gx, &gy, &gz);
+    qmc_get_mag(&mx, &my, &mz);
+    static uint32_t dbg_mag_print_div = 0;
+    if ((dbg_mag_print_div++ % 20) == 0)
+        printf("MAG mx=%d my=%d mz=%d\r\n", (int)mx, (int)my, (int)mz);
+    int pos = 0;
+
+    out[pos++] = ax & 0xFF;
+    out[pos++] = (ax >> 8) & 0xFF;
+    out[pos++] = ay & 0xFF;
+    out[pos++] = (ay >> 8) & 0xFF;
+    out[pos++] = az & 0xFF;
+    out[pos++] = (az >> 8) & 0xFF;
+    out[pos++] = gx & 0xFF;
+    out[pos++] = (gx >> 8) & 0xFF;
+    out[pos++] = gy & 0xFF;
+    out[pos++] = (gy >> 8) & 0xFF;
+    out[pos++] = gz & 0xFF;
+    out[pos++] = (gz >> 8) & 0xFF;
+
+    out[pos++] = mx & 0xFF;
+    out[pos++] = (mx >> 8) & 0xFF;
+    out[pos++] = my & 0xFF;
+    out[pos++] = (my >> 8) & 0xFF;
+    out[pos++] = mz & 0xFF;
+    out[pos++] = (mz >> 8) & 0xFF;
+
+    out[pos++] = qww & 0xFF;
+    out[pos++] = (qww >> 8) & 0xFF;
+    out[pos++] = qwx & 0xFF;
+    out[pos++] = (qwx >> 8) & 0xFF;
+    out[pos++] = qwy & 0xFF;
+    out[pos++] = (qwy >> 8) & 0xFF;
+    out[pos++] = qwz & 0xFF;
+    out[pos++] = (qwz >> 8) & 0xFF;
+
+    return pos; // 26
+}
+
+static int umyo_ble_conn_tick(uint32_t now_ms)
 {
     dbg_tick_calls++;
 
@@ -534,6 +587,71 @@ static int umyo_ble_conn_tick(void)
         dbg_raw_chunks_sent += 3;
         dbg_s1_packets++;
         return 1;
+    }
+
+    if (g_phone_profile == UF1P_S2_SINGLE_ADV_CAL)
+    {
+        // Prefer raw whenever 3 chunks are ready
+        if (g_raw_q_count >= 3)
+        {
+            uint8_t tmp[52];
+            uint32_t base_tsrc = g_raw_q_tsrc[g_raw_q_tail];
+
+            tmp[0] = (base_tsrc) & 0xFF;
+            tmp[1] = (base_tsrc >> 8) & 0xFF;
+            tmp[2] = (base_tsrc >> 16) & 0xFF;
+            tmp[3] = (base_tsrc >> 24) & 0xFF;
+
+            int pos = 4;
+
+            for (int c = 0; c < 3; c++)
+            {
+                uint8_t idx = g_raw_q_tail;
+
+                for (int i = 0; i < RAW_CHUNK_SAMPLES; i++)
+                {
+                    int16_t s = g_raw_q_samples[idx][i];
+                    tmp[pos++] = s & 0xFF;
+                    tmp[pos++] = (s >> 8) & 0xFF;
+                }
+
+                g_raw_q_tail++;
+                if (g_raw_q_tail >= RAW_CHUNK_QUEUE_LEN)
+                    g_raw_q_tail = 0;
+
+                if (g_raw_q_count > 0)
+                    g_raw_q_count--;
+            }
+
+            for (int i = 0; i < pos; i++)
+                umyo_telem_ch.value[i] = tmp[i];
+
+            umyo_telem_ch.val_length = pos; // 52
+            umyo_telem_ch.changed = 1;
+            dbg_raw_chunks_sent += 3;
+            return 1;
+        }
+
+        // Otherwise send aux26 at ~25 Hz
+        if ((now_ms - g_last_aux_send_ms) >= 40)
+        {
+            uint8_t tmp[26];
+            int pos = build_aux26_payload(tmp, sizeof(tmp));
+            if (pos == 26)
+            {
+                for (int i = 0; i < pos; i++)
+                    umyo_telem_ch.value[i] = tmp[i];
+
+                umyo_telem_ch.val_length = pos; // 26
+                umyo_telem_ch.changed = 1;
+                g_last_aux_send_ms = now_ms;
+                dbg_aux_packets_sent++;
+                return 1;
+            }
+        }
+
+        dbg_ret_s1_need_more++;
+        return 0;
     }
 
     // fallback to old raw-only behavior for now for other profiles / future work
@@ -987,7 +1105,7 @@ void switch_to_ble()
     NRF_RADIO->POWER = 0;
     delay_ms(2);
 
-    g_phone_profile = UF1P_S1_SINGLE_LIVE;
+    g_phone_profile = UF1P_S2_SINGLE_ADV_CAL;
 
     g_raw_q_head = 0;
     g_raw_q_tail = 0;
@@ -1008,6 +1126,9 @@ void switch_to_ble()
     dbg_ret_old_need_more = 0;
     dbg_s1_packets = 0;
     dbg_old_packets = 0;
+
+    dbg_aux_packets_sent = 0;
+    g_last_aux_send_ms = 0;
 
     ble_services_ready = 0;
     memset(&umyo_service, 0, sizeof(umyo_service));
@@ -1427,7 +1548,7 @@ int main(void)
             }
             else
             {
-                umyo_ble_conn_tick();
+                umyo_ble_conn_tick(ms);
 
                 static uint32_t dbg_last_dump_ms = 0;
                 if (ble_get_conn_state() && (ms - dbg_last_dump_ms >= 1000))
