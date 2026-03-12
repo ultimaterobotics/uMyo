@@ -69,6 +69,17 @@ static void umyo_get_ble_mac(uint8_t *mac);
 static void umyo_ble_fill_services(void);
 static int umyo_ble_conn_tick(void);
 
+typedef enum
+{
+    UF1P_S1_SINGLE_LIVE = 0x00,
+    UF1P_S2_SINGLE_ADV_CAL = 0x01,
+    UF1P_M1_MULTI_RAW = 0x10,
+    UF1P_M2_MULTI_REF_IMU = 0x11,
+    UF1P_X1_FULL_EXPERIMENTAL = 0xF0,
+} uf1_profile_id_t;
+
+static uf1_profile_id_t g_phone_profile = UF1P_S1_SINGLE_LIVE;
+
 static uint32_t g_raw_next_sample = 0;
 
 #define RAW_CHUNK_SAMPLES 8
@@ -79,6 +90,21 @@ static int16_t g_raw_q_samples[RAW_CHUNK_QUEUE_LEN][RAW_CHUNK_SAMPLES];
 static volatile uint8_t g_raw_q_head = 0;
 static volatile uint8_t g_raw_q_tail = 0;
 static volatile uint8_t g_raw_q_count = 0;
+
+volatile uint32_t dbg_raw_chunks_pushed = 0;
+volatile uint32_t dbg_raw_chunks_sent = 0;
+volatile uint32_t dbg_raw_queue_drops = 0;
+volatile uint32_t dbg_notify_busy_skips = 0;
+volatile uint8_t dbg_raw_q_max = 0;
+
+volatile uint32_t dbg_tick_calls = 0;
+volatile uint32_t dbg_ret_no_conn = 0;
+volatile uint32_t dbg_ret_cccd_off = 0;
+volatile uint32_t dbg_ret_notify_busy = 0;
+volatile uint32_t dbg_ret_s1_need_more = 0;
+volatile uint32_t dbg_ret_old_need_more = 0;
+volatile uint32_t dbg_s1_packets = 0;
+volatile uint32_t dbg_old_packets = 0;
 
 enum param_sends
 {
@@ -397,19 +423,125 @@ static void umyo_ble_fill_services(void)
     ble_services_ready = 1;
 }
 
+static int append_quat_le_i16(uint8_t *out, int pos, int max_len)
+{
+    int16_t qww, qwx, qwy, qwz;
+    lsm_get_quat_packed(&qww, &qwx, &qwy, &qwz);
+
+    if (pos + 8 > max_len)
+        return pos;
+
+    out[pos++] = qww & 0xFF;
+    out[pos++] = (qww >> 8) & 0xFF;
+    out[pos++] = qwx & 0xFF;
+    out[pos++] = (qwx >> 8) & 0xFF;
+    out[pos++] = qwy & 0xFF;
+    out[pos++] = (qwy >> 8) & 0xFF;
+    out[pos++] = qwz & 0xFF;
+    out[pos++] = (qwz >> 8) & 0xFF;
+
+    return pos;
+}
+
+static void dbg_dump_ble_phone_state(void)
+{
+    printf("tick=%lu no_conn=%lu cccd_off=%lu busy=%lu s1_need3=%lu old_need=%lu s1_pkt=%lu old_pkt=%lu pushed=%lu sent=%lu drops=%lu qmax=%u qcount=%u profile=%u\r\n",
+           (unsigned long)dbg_tick_calls,
+           (unsigned long)dbg_ret_no_conn,
+           (unsigned long)dbg_ret_cccd_off,
+           (unsigned long)dbg_ret_notify_busy,
+           (unsigned long)dbg_ret_s1_need_more,
+           (unsigned long)dbg_ret_old_need_more,
+           (unsigned long)dbg_s1_packets,
+           (unsigned long)dbg_old_packets,
+           (unsigned long)dbg_raw_chunks_pushed,
+           (unsigned long)dbg_raw_chunks_sent,
+           (unsigned long)dbg_raw_queue_drops,
+           (unsigned)dbg_raw_q_max,
+           (unsigned)g_raw_q_count,
+           (unsigned)g_phone_profile);
+}
+
 static int umyo_ble_conn_tick(void)
 {
+    dbg_tick_calls++;
+
     if (!ble_get_conn_state())
+    {
+        dbg_ret_no_conn++;
         return 0;
+    }
 
     if (umyo_telem_ch.descriptor_values[0] == 0)
+    {
+        dbg_ret_cccd_off++;
         return 0; // CCCD not enabled
+    }
 
     if (umyo_telem_ch.changed)
+    {
+        dbg_notify_busy_skips++;
+        dbg_ret_notify_busy++;
         return 0; // previous notify still pending, don't overwrite it
+    }
 
+    if (g_phone_profile == UF1P_S1_SINGLE_LIVE)
+    {
+        // S1 is strict raw3 (+ optional QUAT)
+        if (g_raw_q_count < 3)
+        {
+            dbg_ret_s1_need_more++;
+            return 0;
+        }
+
+        uint8_t tmp[60];
+        uint32_t base_tsrc = g_raw_q_tsrc[g_raw_q_tail];
+
+        tmp[0] = (base_tsrc) & 0xFF;
+        tmp[1] = (base_tsrc >> 8) & 0xFF;
+        tmp[2] = (base_tsrc >> 16) & 0xFF;
+        tmp[3] = (base_tsrc >> 24) & 0xFF;
+
+        int pos = 4;
+
+        for (int c = 0; c < 3; c++)
+        {
+            uint8_t idx = g_raw_q_tail;
+
+            for (int i = 0; i < RAW_CHUNK_SAMPLES; i++)
+            {
+                int16_t s = g_raw_q_samples[idx][i];
+                tmp[pos++] = s & 0xFF;
+                tmp[pos++] = (s >> 8) & 0xFF;
+            }
+
+            g_raw_q_tail++;
+            if (g_raw_q_tail >= RAW_CHUNK_QUEUE_LEN)
+                g_raw_q_tail = 0;
+
+            if (g_raw_q_count > 0)
+                g_raw_q_count--;
+        }
+
+        // TEMP: keep this commented for now while diagnosing
+        pos = append_quat_le_i16(tmp, pos, sizeof(tmp));
+
+        for (int i = 0; i < pos; i++)
+            umyo_telem_ch.value[i] = tmp[i];
+
+        umyo_telem_ch.val_length = pos; // should be 52 in this test
+        umyo_telem_ch.changed = 1;
+        dbg_raw_chunks_sent += 3;
+        dbg_s1_packets++;
+        return 1;
+    }
+
+    // fallback to old raw-only behavior for now for other profiles / future work
     if (g_raw_q_count == 0)
-        return 0; // nothing queued
+    {
+        dbg_ret_old_need_more++;
+        return 0;
+    }
 
     uint8_t chunk_count = 1;
     if (g_raw_q_count >= 3)
@@ -420,7 +552,6 @@ static int umyo_ble_conn_tick(void)
     uint8_t tmp[52];
     uint32_t base_tsrc = g_raw_q_tsrc[g_raw_q_tail];
 
-    // u32 little-endian base t_src_sample
     tmp[0] = (base_tsrc) & 0xFF;
     tmp[1] = (base_tsrc >> 8) & 0xFF;
     tmp[2] = (base_tsrc >> 16) & 0xFF;
@@ -450,9 +581,10 @@ static int umyo_ble_conn_tick(void)
     for (int i = 0; i < pos; i++)
         umyo_telem_ch.value[i] = tmp[i];
 
-    umyo_telem_ch.val_length = pos; // 20, 36, or 52
+    umyo_telem_ch.val_length = pos;
     umyo_telem_ch.changed = 1;
-
+    dbg_raw_chunks_sent += chunk_count;
+    dbg_old_packets++;
     return 1;
 }
 
@@ -584,10 +716,16 @@ int push_adc_data()
             {
                 g_raw_q_head = next_head;
                 g_raw_q_count++;
+
+                dbg_raw_chunks_pushed++;
+                if (g_raw_q_count > dbg_raw_q_max)
+                    dbg_raw_q_max = g_raw_q_count;
             }
             else
             {
                 // queue full: overwrite oldest
+                dbg_raw_queue_drops++;
+
                 g_raw_q_head = next_head;
                 g_raw_q_tail++;
                 if (g_raw_q_tail >= RAW_CHUNK_QUEUE_LEN)
@@ -848,6 +986,28 @@ void switch_to_ble()
     rf_dettach_tx_irq();
     NRF_RADIO->POWER = 0;
     delay_ms(2);
+
+    g_phone_profile = UF1P_S1_SINGLE_LIVE;
+
+    g_raw_q_head = 0;
+    g_raw_q_tail = 0;
+    g_raw_q_count = 0;
+    g_raw_next_sample = 0;
+
+    dbg_raw_chunks_pushed = 0;
+    dbg_raw_chunks_sent = 0;
+    dbg_raw_queue_drops = 0;
+    dbg_notify_busy_skips = 0;
+    dbg_raw_q_max = 0;
+
+    dbg_tick_calls = 0;
+    dbg_ret_no_conn = 0;
+    dbg_ret_cccd_off = 0;
+    dbg_ret_notify_busy = 0;
+    dbg_ret_s1_need_more = 0;
+    dbg_ret_old_need_more = 0;
+    dbg_s1_packets = 0;
+    dbg_old_packets = 0;
 
     ble_services_ready = 0;
     memset(&umyo_service, 0, sizeof(umyo_service));
@@ -1267,10 +1427,13 @@ int main(void)
             }
             else
             {
-                if (unsent_cnt > 0)
+                umyo_ble_conn_tick();
+
+                static uint32_t dbg_last_dump_ms = 0;
+                if (ble_get_conn_state() && (ms - dbg_last_dump_ms >= 1000))
                 {
-                    if (umyo_ble_conn_tick())
-                        unsent_cnt = 0;
+                    dbg_last_dump_ms = ms;
+                    dbg_dump_ble_phone_state();
                 }
             }
         }
