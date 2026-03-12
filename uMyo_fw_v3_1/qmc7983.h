@@ -52,6 +52,7 @@ typedef struct
 void qmc_init();
 void qmc_read();
 void qmc_get_mag(int16_t *mx, int16_t *my, int16_t *mz);
+void qmc_get_mag_raw(int16_t *mx, int16_t *my, int16_t *mz);
 int qmc_process_calibration();
 void qmc_end_calibration();
 void qmc_get_calibration_data(int16_t *min_x, int16_t *max_x,

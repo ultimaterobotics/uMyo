@@ -239,26 +239,17 @@ void qmc_init()
         // QMC5883P detected
         qmc_chip = QMC_CHIP_5883P;
         qmc_addr = qmc7983_addr;
-        qmc_data_reg = QMC5883P_DATAX_A;
+        qmc_data_reg = QMC5883P_DATAX_A; // data starts at 0x01 on P
 
-        // Configure P (CTRL2 then CTRL1). Keep same intent: 2G, 100Hz, continuous-ish.
-        // CTRL1: OSR2[7:6] OSR1[5:4] ODR[3:2] MODE[1:0]
-        uint8_t ctrl1 =
-            (0b10 << 6) | // OSR2
-            (0b00 << 4) | // OSR1
-            (0b10 << 2) | // ODR = 100Hz
-            (0b01);       // MODE = normal/continuous measurement style
-
-        // CTRL2: ... RNG[3:2] SETRST[1:0]
-        uint8_t ctrl2 =
-            (0b11 << 2) | // RNG = 2G
-            (0b01);       // SET/RESET on
-
-        // Datasheet example also writes 0x06 to 0x29 to define axis sign
+        // Datasheet-style init for QMC5883P:
+        // 0x29 = 0x06  axis sign
+        // 0x0B = 0x08  set/reset on, 8G range
+        // 0x0A = 0xC3  continuous mode example
         twim_write_reg(qmc_addr, QMC5883P_SIGN_A, 0x06);
-        twim_write_reg(qmc_addr, QMC5883P_CTRL2_A, ctrl2);
-        twim_write_reg(qmc_addr, QMC5883P_CTRL1_A, ctrl1);
+        twim_write_reg(qmc_addr, QMC5883P_CTRL2_A, 0x08);
+        twim_write_reg(qmc_addr, QMC5883P_CTRL1_A, 0xC3);
 
+        delay_ms(2);
         twim_read_buf(qmc_addr, qmc_data_reg, 6);
         return;
     }
@@ -300,6 +291,7 @@ void qmc_init()
 
 uint32_t qmc_last_data_time = 0;
 int16_t mag_x = 0, mag_y = 0, mag_z = 0;
+
 int16_t mx_min = 32760, mx_max = -32760;
 int16_t my_min = 32760, my_max = -32760;
 int16_t mz_min = 32760, mz_max = -32760;
@@ -313,6 +305,13 @@ void qmc_read()
         return; // 100 Hz update expected
     qmc_last_data_time = ms;
 
+    uint32_t start_ms = millis();
+    while (twim_busy && (millis() - start_ms < 20))
+        ;
+
+    if (twim_busy)
+        return;
+
     uint8_t dpos = 0;
     mag_x = (twim_buf_rx[dpos + 1] << 8) | twim_buf_rx[dpos];
     dpos += 2;
@@ -321,8 +320,7 @@ void qmc_read()
     mag_z = (twim_buf_rx[dpos + 1] << 8) | twim_buf_rx[dpos];
     dpos += 2;
 
-    // Axis remap: ONLY for QMC5883L (as per your dev's conclusion)
-    // QMC5883P should behave like the old 0x2C ("qmc7983") path.
+    // Axis remap: ONLY for QMC5883L
     if (qmc_chip == QMC_CHIP_5883L)
     {
         int16_t tt = mag_x;
@@ -358,6 +356,7 @@ void qmc_read()
     m2 = mz_max - mz_min;
     mag_z = 10000 * m1 / m2 - 5000;
 
+    // START NEXT READ
     twim_read_buf(qmc_addr, qmc_data_reg, 6);
 }
 

@@ -478,9 +478,7 @@ static int build_aux26_payload(uint8_t *out, int max_len)
     lsm_get_acc(&ax, &ay, &az);
     lsm_get_W(&gx, &gy, &gz);
     qmc_get_mag(&mx, &my, &mz);
-    static uint32_t dbg_mag_print_div = 0;
-    if ((dbg_mag_print_div++ % 20) == 0)
-        printf("MAG mx=%d my=%d mz=%d\r\n", (int)mx, (int)my, (int)mz);
+
     int pos = 0;
 
     out[pos++] = ax & 0xFF;
