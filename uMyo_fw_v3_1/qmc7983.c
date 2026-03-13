@@ -273,7 +273,7 @@ void qmc_init()
         return;
     }
 
-    // Fallback: treat as old "qmc7983" path at 0x2C
+    // Legacy/fallback init path: treat as old "qmc7983" path at 0x2C
     qmc_chip = QMC_CHIP_7983_LIKE;
     qmc_addr = qmc7983_addr;
     qmc_data_reg = QMC7983_DATAX_A;
@@ -344,6 +344,16 @@ void qmc_read()
             mz_min = mag_z - 1;
     }
 
+    int rx = mx_max - mx_min;
+    int ry = my_max - my_min;
+    int rz = mz_max - mz_min;
+
+    if (rx < 32 || ry < 32 || rz < 32)
+    {
+        twim_read_buf(qmc_addr, qmc_data_reg, 6);
+        return;
+    }
+
     int m1 = mag_x - mx_min;
     int m2 = mx_max - mx_min;
     mag_x = 10000 * m1 / m2 - 5000;
@@ -356,7 +366,11 @@ void qmc_read()
     m2 = mz_max - mz_min;
     mag_z = 10000 * m1 / m2 - 5000;
 
-    // START NEXT READ
+    // Re-arm next sensor read here.
+    // Without scheduling the next twim_read_buf(), MAG can appear "alive"
+    // but keep re-parsing stale data from a previous read.
+    // IMPORTANT: do not remove this re-arm call.
+    // qmc_read() consumes current data and must schedule the next 6-byte read.
     twim_read_buf(qmc_addr, qmc_data_reg, 6);
 }
 

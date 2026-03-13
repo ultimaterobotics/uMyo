@@ -536,9 +536,18 @@ static int umyo_ble_conn_tick(uint32_t now_ms)
         return 0; // previous notify still pending, don't overwrite it
     }
 
+    // Connected BLE payload sizes:
+    // 52 bytes = raw3 (raw EMG only)
+    // 60 bytes = raw3 + QUAT
+    // 26 bytes = IMU + MAG + QUAT
+    //
+    // Profiles:
+    // S1 -> 60-byte notify (raw3 + QUAT)
+    // S2 -> 52-byte raw3 notify + 26-byte aux notify
+
     if (g_phone_profile == UF1P_S1_SINGLE_LIVE)
     {
-        // S1 is strict raw3 (+ optional QUAT)
+        // S1 packet (single-sensor live mode): raw3 + QUAT (60 bytes)
         if (g_raw_q_count < 3)
         {
             dbg_ret_s1_need_more++;
@@ -574,13 +583,12 @@ static int umyo_ble_conn_tick(uint32_t now_ms)
                 g_raw_q_count--;
         }
 
-        // TEMP: keep this commented for now while diagnosing
         pos = append_quat_le_i16(tmp, pos, sizeof(tmp));
 
         for (int i = 0; i < pos; i++)
             umyo_telem_ch.value[i] = tmp[i];
 
-        umyo_telem_ch.val_length = pos; // should be 52 in this test
+        umyo_telem_ch.val_length = pos; // notify payload length
         umyo_telem_ch.changed = 1;
         dbg_raw_chunks_sent += 3;
         dbg_s1_packets++;
@@ -589,6 +597,8 @@ static int umyo_ble_conn_tick(uint32_t now_ms)
 
     if (g_phone_profile == UF1P_S2_SINGLE_ADV_CAL)
     {
+        // S2 raw packet: raw3 only (52 bytes)
+        // S2 aux packet: IMU + MAG + QUAT (26 bytes)
         // Prefer raw whenever 3 chunks are ready
         if (g_raw_q_count >= 3)
         {
@@ -1544,16 +1554,12 @@ int main(void)
                         unsent_cnt = 0;
                 }
             }
+            // Connected BLE streaming must tick unconditionally while GATT is active.
+            // Do not gate this by unsent_cnt: connected mode uses notify flow, and
+            // gating here can make notifications appear enabled while no data is sent.
             else
             {
                 umyo_ble_conn_tick(ms);
-
-                static uint32_t dbg_last_dump_ms = 0;
-                if (ble_get_conn_state() && (ms - dbg_last_dump_ms >= 1000))
-                {
-                    dbg_last_dump_ms = ms;
-                    dbg_dump_ble_phone_state();
-                }
             }
         }
         //		if((ms%1000) == 499) leds_pulse(0, 255*(!had_adc), 255*had_adc, 10), had_adc = 0;
