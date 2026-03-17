@@ -22,3 +22,7 @@ typedef struct
 
 sDevice_state read_current_state();
 void update_current_state(sDevice_state state);
+
+#define DEVICE_NAME_LEN 16
+void dev_name_read(char *out_name);
+void dev_name_write(const char *name);

@@ -62,7 +62,11 @@ float avg_muscle_level = 0;
 
 static sService umyo_service;
 static sCharacteristic umyo_telem_ch;
+static sCharacteristic umyo_name_ch;
 static volatile uint8_t ble_services_ready = 0;
+
+static char g_device_name[16];
+static uint8_t g_name_sent_this_conn = 0;
 
 static int umyo_build_telem_payload(uint8_t *out, int max_len);
 static void umyo_get_ble_mac(uint8_t *mac);
@@ -389,6 +393,17 @@ static int umyo_build_telem_payload(uint8_t *out, int max_len)
     return dpos; // 15
 }
 
+static void umyo_name_ch_update(void)
+{
+    int nlen = 0;
+    while (nlen < 15 && g_device_name[nlen])
+        nlen++;
+    for (int i = 0; i < nlen; i++)
+        umyo_name_ch.value[i] = (uint8_t)g_device_name[i];
+    umyo_name_ch.value[nlen] = 0;
+    umyo_name_ch.val_length = nlen + 1;
+}
+
 static void umyo_ble_fill_services(void)
 {
     if (ble_services_ready)
@@ -420,8 +435,25 @@ static void umyo_ble_fill_services(void)
 
     ble_add_characteristic(&umyo_telem_ch);
 
+    umyo_name_ch.handle = 0x34;
+    umyo_name_ch.value_handle = 0x35;
+    umyo_name_ch.uuid_16 = 0;
+    ble_uuid_from_text(umyo_name_ch.uuid_128, "FC7A850D-C1A5-F61F-0DA7-9995621FBD02");
+
+    umyo_name_ch.val_type = VALUE_TYPE_UTF8;
+    umyo_name_ch.properties = CHARACTERISTIC_READ | CHARACTERISTIC_WRITE_NO_RESP | CHARACTERISTIC_NOTIFY;
+
+    umyo_name_ch.descriptor_count = 1;
+    umyo_name_ch.descriptor_uuids[0] = 0x2902; // CCCD
+    umyo_name_ch.descriptor_handles[0] = 0x36;
+    umyo_name_ch.descriptor_values[0] = 0;
+
+    ble_add_characteristic(&umyo_name_ch);
+    umyo_name_ch_update();
+
     umyo_service.char_idx[0] = umyo_telem_ch.mem_idx;
-    umyo_service.char_count = 1;
+    umyo_service.char_idx[1] = umyo_name_ch.mem_idx;
+    umyo_service.char_count = 2;
 
     ble_services_ready = 1;
 }
@@ -750,7 +782,9 @@ int prepare_and_send_BLE()
     data[0] = flags.value;
     pp = ble_add_field_to_pdu(pdu_data, pp, data, 1, PDU_FLAGS);
 
-    int nlen = sprintf((char *)data, "uMyo v2");
+    int nlen = 0;
+    while (nlen < 7 && g_device_name[nlen])
+        data[nlen] = (uint8_t)g_device_name[nlen], nlen++;
     pp = ble_add_field_to_pdu(pdu_data, pp, data, nlen, PDU_SHORT_NAME);
 
     // 17 bytes remains for payload
@@ -1141,6 +1175,7 @@ void switch_to_ble()
     ble_services_ready = 0;
     memset(&umyo_service, 0, sizeof(umyo_service));
     memset(&umyo_telem_ch, 0, sizeof(umyo_telem_ch));
+    memset(&umyo_name_ch, 0, sizeof(umyo_name_ch));
 
     ble_init_radio();
     ble_update_our_mtu(64);
@@ -1344,6 +1379,24 @@ int main(void)
     //	star_init(21, 1000, 2000, 0);
 
     dev_state = read_current_state();
+
+    dev_name_read(g_device_name);
+    if (g_device_name[0] == '\0')
+    {
+        // Generate default name from last 2 variable MAC bytes
+        uint8_t mac[6];
+        umyo_get_ble_mac(mac);
+        int pos = 0;
+        const char *prefix = "uMyo-";
+        while (*prefix) g_device_name[pos++] = *prefix++;
+        const char hex[] = "0123456789ABCDEF";
+        g_device_name[pos++] = hex[(mac[3] >> 4) & 0xF];
+        g_device_name[pos++] = hex[mac[3] & 0xF];
+        g_device_name[pos++] = hex[(mac[4] >> 4) & 0xF];
+        g_device_name[pos++] = hex[mac[4] & 0xF];
+        g_device_name[pos] = '\0';
+    }
+
     if (dev_state.fields.radio_mode == radio_mode_ble)
         radio_mode = radio_mode_ble;
     if (dev_state.fields.radio_mode == radio_mode_fast32)
@@ -1548,6 +1601,7 @@ int main(void)
         {
             if (!ble_get_conn_state())
             {
+                g_name_sent_this_conn = 0;
                 if (unsent_cnt > 0)
                 {
                     if (prepare_and_send_BLE())
@@ -1559,6 +1613,34 @@ int main(void)
             // gating here can make notifications appear enabled while no data is sent.
             else
             {
+                // Persist name written by Android
+                if (umyo_name_ch.had_write)
+                {
+                    char new_name[16];
+                    __disable_irq();
+                    for (int i = 0; i < 16; i++)
+                        new_name[i] = (char)umyo_name_ch.value[i];
+                    __enable_irq();
+                    umyo_name_ch.had_write = 0;
+                    new_name[15] = '\0';
+                    // Require at least one printable ASCII character
+                    if ((uint8_t)new_name[0] >= 0x20 && (uint8_t)new_name[0] <= 0x7E)
+                    {
+                        for (int i = 0; i < 16; i++)
+                            g_device_name[i] = new_name[i];
+                        dev_name_write(g_device_name);
+                        umyo_name_ch_update();
+                    }
+                }
+
+                // One-shot: notify name to Android on first connection
+                if (umyo_name_ch.descriptor_values[0] && !g_name_sent_this_conn && !umyo_name_ch.changed)
+                {
+                    umyo_name_ch_update();
+                    umyo_name_ch.changed = 1;
+                    g_name_sent_this_conn = 1;
+                }
+
                 umyo_ble_conn_tick(ms);
             }
         }

@@ -5,6 +5,9 @@
 // around the flash end, storage size = page size
 #define STORAGE_PAGE_ADDRESS 0x2B000
 
+// Above the OTA erase ceiling (bootloader erases 0x4000–0x3FFFF max), safe permanently
+#define NAME_STORAGE_PAGE_ADDRESS 0x40000
+
 #define FLASH_READFLAG 0x00
 #define FLASH_WRITEFLAG 0x01
 #define FLASH_ERASEFLAG 0x02
@@ -153,6 +156,64 @@ void update_current_state(sDevice_state state)
     {
         uint32_t addr = start_addr + pos_to_write * record_size + n * 4;
         write_word(addr, state.values[n]);
+    }
+    write_end();
+}
+
+// Device name storage — page at NAME_STORAGE_PAGE_ADDRESS, one record = 16 bytes.
+// Wear-leveling: scan forward for first 0xFFFFFFFF slot; return last valid record.
+// Erase and wrap when page is full.
+
+void dev_name_read(char *out_name)
+{
+    uint32_t page_size = NRF_FICR->CODEPAGESIZE;
+    uint32_t start_addr = NAME_STORAGE_PAGE_ADDRESS;
+    int record_size = DEVICE_NAME_LEN;
+    int records_cnt = page_size / record_size;
+    int cur_pos = 0;
+    char prev[DEVICE_NAME_LEN];
+    for (int n = 0; n < DEVICE_NAME_LEN; n++)
+        prev[n] = 0;
+    while (cur_pos < records_cnt)
+    {
+        uint32_t addr = start_addr + cur_pos * record_size;
+        if (*(uint32_t *)addr == 0xFFFFFFFF)
+            break;
+        for (int n = 0; n < DEVICE_NAME_LEN; n++)
+            prev[n] = *(uint8_t *)(addr + n);
+        cur_pos++;
+    }
+    for (int n = 0; n < DEVICE_NAME_LEN; n++)
+        out_name[n] = prev[n];
+}
+
+void dev_name_write(const char *name)
+{
+    uint32_t page_size = NRF_FICR->CODEPAGESIZE;
+    uint32_t start_addr = NAME_STORAGE_PAGE_ADDRESS;
+    int record_size = DEVICE_NAME_LEN;
+    int records_cnt = page_size / record_size;
+    int cur_pos = 0;
+    while (cur_pos < records_cnt)
+    {
+        uint32_t addr = start_addr + cur_pos * record_size;
+        if (*(uint32_t *)addr == 0xFFFFFFFF)
+            break;
+        cur_pos++;
+    }
+    if (cur_pos >= records_cnt - 1)
+    {
+        erase_page(start_addr);
+        cur_pos = 0;
+    }
+    uint32_t write_addr = start_addr + cur_pos * record_size;
+    write_start();
+    for (int n = 0; n < record_size / 4; n++)
+    {
+        uint32_t word = 0;
+        for (int b = 0; b < 4; b++)
+            word |= (uint32_t)(uint8_t)name[n * 4 + b] << (b * 8);
+        write_word(write_addr + n * 4, word);
     }
     write_end();
 }
