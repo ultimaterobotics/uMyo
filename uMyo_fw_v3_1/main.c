@@ -631,7 +631,25 @@ static int umyo_ble_conn_tick(uint32_t now_ms)
     {
         // S2 raw packet: raw3 only (52 bytes)
         // S2 aux packet: IMU + MAG + QUAT (26 bytes)
-        // Prefer raw whenever 3 chunks are ready
+        // Aux26 deadline checked first — guarantees QUAT/IMU rate under any EMG load.
+        // EMG sends on all remaining ticks.
+        if ((now_ms - g_last_aux_send_ms) >= 40)
+        {
+            uint8_t tmp[26];
+            int pos = build_aux26_payload(tmp, sizeof(tmp));
+            if (pos == 26)
+            {
+                for (int i = 0; i < pos; i++)
+                    umyo_telem_ch.value[i] = tmp[i];
+
+                umyo_telem_ch.val_length = pos; // 26
+                umyo_telem_ch.changed = 1;
+                g_last_aux_send_ms = now_ms;
+                dbg_aux_packets_sent++;
+                return 1;
+            }
+        }
+
         if (g_raw_q_count >= 3)
         {
             uint8_t tmp[52];
@@ -670,24 +688,6 @@ static int umyo_ble_conn_tick(uint32_t now_ms)
             umyo_telem_ch.changed = 1;
             dbg_raw_chunks_sent += 3;
             return 1;
-        }
-
-        // Otherwise send aux26 at ~25 Hz
-        if ((now_ms - g_last_aux_send_ms) >= 40)
-        {
-            uint8_t tmp[26];
-            int pos = build_aux26_payload(tmp, sizeof(tmp));
-            if (pos == 26)
-            {
-                for (int i = 0; i < pos; i++)
-                    umyo_telem_ch.value[i] = tmp[i];
-
-                umyo_telem_ch.val_length = pos; // 26
-                umyo_telem_ch.changed = 1;
-                g_last_aux_send_ms = now_ms;
-                dbg_aux_packets_sent++;
-                return 1;
-            }
         }
 
         dbg_ret_s1_need_more++;
