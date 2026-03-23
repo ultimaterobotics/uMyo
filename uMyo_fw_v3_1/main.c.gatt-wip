@@ -12,8 +12,6 @@
 #include "urf_radio.h"
 #include "urf_star_protocol.h"
 #include "urf_ble_peripheral.h"
-#include "../urf_lib/urf_ble_att_process.h"
-#include "../urf_lib/ble_const.h"
 #include "ble_const.h"
 #include "urf_timer.h"
 #include "adc_read.h"
@@ -22,6 +20,8 @@
 #include "lsm6ds3.h"
 #include "qmc7983.h"
 #include "persistent_storage.h"
+#include "../urf_lib/urf_ble_att_process.h" // sService, sCharacteristic, ble_add_service/characteristic
+#include "../urf_lib/ble_const.h"           // UUID_PRIMARY_SERVICE, CHARACTERISTIC_NOTIFY, etc.
 
 uint8_t pin_button = 19;
 uint8_t pin_syson = 4;
@@ -60,58 +60,19 @@ uint8_t param_send_id = 0;
 uint8_t emg_raw_data_send = 1;
 float avg_muscle_level = 0;
 
+// --- uMyo BLE GATT (telemetry over notify) ---
 static sService umyo_service;
 static sCharacteristic umyo_telem_ch;
-static sCharacteristic umyo_name_ch;
+
 static volatile uint8_t ble_services_ready = 0;
 
-static char g_device_name[16];
-static uint8_t g_name_sent_this_conn = 0;
-
+// last manufacturer telemetry payload (raw bytes, NOT including AD len/type)
+static uint8_t g_mfg_telem[32];
+static volatile int g_mfg_telem_len = 0;
 static int umyo_build_telem_payload(uint8_t *out, int max_len);
 static void umyo_get_ble_mac(uint8_t *mac);
 static void umyo_ble_fill_services(void);
-static int umyo_ble_conn_tick(uint32_t now_ms);
-
-typedef enum
-{
-    UF1P_S1_SINGLE_LIVE = 0x00,
-    UF1P_S2_SINGLE_ADV_CAL = 0x01,
-    UF1P_M1_MULTI_RAW = 0x10,
-    UF1P_M2_MULTI_REF_IMU = 0x11,
-    UF1P_X1_FULL_EXPERIMENTAL = 0xF0,
-} uf1_profile_id_t;
-
-static uf1_profile_id_t g_phone_profile = UF1P_S1_SINGLE_LIVE;
-
-static uint32_t g_raw_next_sample = 0;
-
-#define RAW_CHUNK_SAMPLES 8
-#define RAW_CHUNK_QUEUE_LEN 32
-
-static uint32_t g_raw_q_tsrc[RAW_CHUNK_QUEUE_LEN];
-static int16_t g_raw_q_samples[RAW_CHUNK_QUEUE_LEN][RAW_CHUNK_SAMPLES];
-static volatile uint8_t g_raw_q_head = 0;
-static volatile uint8_t g_raw_q_tail = 0;
-static volatile uint8_t g_raw_q_count = 0;
-
-volatile uint32_t dbg_raw_chunks_pushed = 0;
-volatile uint32_t dbg_raw_chunks_sent = 0;
-volatile uint32_t dbg_raw_queue_drops = 0;
-volatile uint32_t dbg_notify_busy_skips = 0;
-volatile uint8_t dbg_raw_q_max = 0;
-
-volatile uint32_t dbg_tick_calls = 0;
-volatile uint32_t dbg_ret_no_conn = 0;
-volatile uint32_t dbg_ret_cccd_off = 0;
-volatile uint32_t dbg_ret_notify_busy = 0;
-volatile uint32_t dbg_ret_s1_need_more = 0;
-volatile uint32_t dbg_ret_old_need_more = 0;
-volatile uint32_t dbg_s1_packets = 0;
-volatile uint32_t dbg_old_packets = 0;
-
-volatile uint32_t dbg_aux_packets_sent = 0;
-static uint32_t g_last_aux_send_ms = 0;
+static int umyo_ble_conn_tick(void);
 
 enum param_sends
 {
@@ -125,13 +86,16 @@ void prepare_data_packet()
     packet_id++;
     if (packet_id > 128)
         packet_id = 0;
+
     data_packet[idx++] = packet_id;
     data_packet[idx++] = 0; // fill in the end
+
     uint32_t unit_id = NRF_FICR->DEVICEID[1];
     data_packet[idx++] = (unit_id >> 24) & 0xFF;
     data_packet[idx++] = (unit_id >> 16) & 0xFF;
     data_packet[idx++] = (unit_id >> 8) & 0xFF;
     data_packet[idx++] = (unit_id) & 0xFF;
+
     uint8_t send_cnt = 8;
     data_packet[idx++] = 80 + send_cnt;
 
@@ -144,102 +108,93 @@ void prepare_data_packet()
     data_packet[idx++] = param_send_id;
     if (param_send_id == param_batt)
     {
-        int bat_mv = adc_read_battery();
-        if (bat_mv < 2000)
-            battery_level = 0;
-        else
-            battery_level = (bat_mv - 2000) / 10;
-        if (bat_mv > 4500)
-            battery_level = 255;
-        data_packet[idx++] = battery_level;
-        data_packet[idx++] = 101; // version_id
-        data_packet[idx++] = 0;
+        // 17 bytes remains for payload (we currently use 15)
+        // Build manufacturer telemetry payload (same 15-byte layout as ADV)
+        uint8_t data[40];
+        int dpos = umyo_build_telem_payload(data, (int)sizeof(data));
+
+        // Capture the manufacturer payload for notify mode too
+        int n = dpos;
+        if (n > (int)sizeof(g_mfg_telem))
+            n = (int)sizeof(g_mfg_telem);
+        for (int i = 0; i < n; i++)
+            g_mfg_telem[i] = data[i];
+        g_mfg_telem_len = n;
+
+        // NOTE: this line only belongs to ADV builder (prepare_and_send_BLE),
+        // NOT here in the radio packet builder. Kept for continuity:
+        // pp = ble_add_field_to_pdu(pdu_data, pp, data, dpos, PDU_MANUFACTURER_SPEC);
+
+        int16_t qww, qwx, qwy, qwz;
+        lsm_get_quat_packed(&qww, &qwx, &qwy, &qwz);
+
+        int16_t raX, raY, raZ;
+        lsm_get_acc(&raX, &raY, &raZ);
+
+        // If you ever want gyro in the packet again, this is how it used to be:
+        // int16_t rwX, rwY, rwZ;
+        // lsm_get_W(&rwX, &rwY, &rwZ);
+
+        data_packet[idx++] = qww >> 8;
+        data_packet[idx++] = qww & 0xFF;
+        data_packet[idx++] = qwx >> 8;
+        data_packet[idx++] = qwx & 0xFF;
+        data_packet[idx++] = qwy >> 8;
+        data_packet[idx++] = qwy & 0xFF;
+        data_packet[idx++] = qwz >> 8;
+        data_packet[idx++] = qwz & 0xFF;
+        // 44 bytes at this point
+
+        //	data_packet[idx++] = rwX>>8;
+        //	data_packet[idx++] = rwX&0xFF;
+        //	data_packet[idx++] = rwY>>8;
+        //	data_packet[idx++] = rwY&0xFF;
+        //	data_packet[idx++] = rwZ>>8;
+        //	data_packet[idx++] = rwZ&0xFF;
+
+        data_packet[idx++] = raX >> 8;
+        data_packet[idx++] = raX & 0xFF;
+        data_packet[idx++] = raY >> 8;
+        data_packet[idx++] = raY & 0xFF;
+        data_packet[idx++] = raZ >> 8;
+        data_packet[idx++] = raZ & 0xFF;
+        // 50 bytes at this point
+
+        int16_t roll = lsm_get_roll();
+        int16_t yaw = lsm_get_yaw();
+        int16_t pitch = lsm_get_pitch();
+
+        data_packet[idx++] = yaw >> 8;
+        data_packet[idx++] = yaw & 0xFF;
+        data_packet[idx++] = pitch >> 8;
+        data_packet[idx++] = pitch & 0xFF;
+        data_packet[idx++] = roll >> 8;
+        data_packet[idx++] = roll & 0xFF;
+        // 56 bytes at this point
+
+        int16_t mX, mY, mZ;
+        qmc_get_mag(&mX, &mY, &mZ);
+        data_packet[idx++] = mX >> 8;
+        data_packet[idx++] = mX & 0xFF;
+        data_packet[idx++] = mY >> 8;
+        data_packet[idx++] = mY & 0xFF;
+        data_packet[idx++] = mZ >> 8;
+        data_packet[idx++] = mZ & 0xFF;
+        // 62 bytes at this point
+
+        //	int16_t yaw, pitch, roll;
+        //	lsm_get_angles(&yaw, &pitch, &roll);
+        //	data_packet[idx++] = pitch>>8;
+        //	data_packet[idx++] = pitch&0xFF;
+        //	data_packet[idx++] = roll>>8;
+        //	data_packet[idx++] = roll&0xFF;
+
+        //	sLSM6DS3 *imu = lsm_get_object();
+        //	int sp0 = cur_spectr[0];
+        //	data_packet[idx++] = sp0>>8;
+
+        data_packet[1] = idx;
     }
-
-    data_packet[idx++] = adc_data_id;
-    int start_cnt = adc_buf_pos - send_cnt;
-    if (start_cnt < 0)
-        start_cnt += adc_buf_len;
-    for (int n = 0; n < send_cnt; n++)
-    {
-        data_packet[idx++] = adc_buffer[start_cnt] >> 8;
-        data_packet[idx++] = adc_buffer[start_cnt] & 0xFF;
-        start_cnt++;
-        if (start_cnt >= adc_buf_len)
-            start_cnt = 0;
-    }
-    for (int x = 0; x < 4; x++)
-    {
-        int16_t send_v = cur_spectr[x];
-        data_packet[idx++] = send_v >> 8;
-        data_packet[idx++] = send_v & 0xFF;
-    }
-    // 36 bytes at this point
-    int16_t qww, qwx, qwy, qwz;
-    int16_t raX, raY, raZ;
-    int16_t rwX, rwY, rwZ;
-    lsm_get_quat_packed(&qww, &qwx, &qwy, &qwz);
-    lsm_get_acc(&raX, &raY, &raZ);
-    lsm_get_W(&rwX, &rwY, &rwZ);
-
-    data_packet[idx++] = qww >> 8;
-    data_packet[idx++] = qww & 0xFF;
-    data_packet[idx++] = qwx >> 8;
-    data_packet[idx++] = qwx & 0xFF;
-    data_packet[idx++] = qwy >> 8;
-    data_packet[idx++] = qwy & 0xFF;
-    data_packet[idx++] = qwz >> 8;
-    data_packet[idx++] = qwz & 0xFF;
-    // 44 bytes at this point
-
-    //	data_packet[idx++] = rwX>>8;
-    //	data_packet[idx++] = rwX&0xFF;
-    //	data_packet[idx++] = rwY>>8;
-    //	data_packet[idx++] = rwY&0xFF;
-    //	data_packet[idx++] = rwZ>>8;
-    //	data_packet[idx++] = rwZ&0xFF;
-
-    data_packet[idx++] = raX >> 8;
-    data_packet[idx++] = raX & 0xFF;
-    data_packet[idx++] = raY >> 8;
-    data_packet[idx++] = raY & 0xFF;
-    data_packet[idx++] = raZ >> 8;
-    data_packet[idx++] = raZ & 0xFF;
-    // 50 bytes at this point
-
-    int16_t roll = lsm_get_roll();
-    int16_t yaw = lsm_get_yaw();
-    int16_t pitch = lsm_get_pitch();
-
-    data_packet[idx++] = yaw >> 8;
-    data_packet[idx++] = yaw & 0xFF;
-    data_packet[idx++] = pitch >> 8;
-    data_packet[idx++] = pitch & 0xFF;
-    data_packet[idx++] = roll >> 8;
-    data_packet[idx++] = roll & 0xFF;
-    // 56 bytes at this point
-
-    int16_t mX, mY, mZ;
-    qmc_get_mag(&mX, &mY, &mZ);
-    data_packet[idx++] = mX >> 8;
-    data_packet[idx++] = mX & 0xFF;
-    data_packet[idx++] = mY >> 8;
-    data_packet[idx++] = mY & 0xFF;
-    data_packet[idx++] = mZ >> 8;
-    data_packet[idx++] = mZ & 0xFF;
-    // 62 bytes at this point
-
-    //	int16_t yaw, pitch, roll;
-    //	lsm_get_angles(&yaw, &pitch, &roll);
-    //	data_packet[idx++] = pitch>>8;
-    //	data_packet[idx++] = pitch&0xFF;
-    //	data_packet[idx++] = roll>>8;
-    //	data_packet[idx++] = roll&0xFF;
-
-    //	sLSM6DS3 *imu = lsm_get_object();
-    //	int sp0 = cur_spectr[0];
-    //	data_packet[idx++] = sp0>>8;
-    data_packet[1] = idx;
 }
 
 void prepare_data_packet32()
@@ -332,15 +287,56 @@ void prepare_data_packet32()
     data_packet[idx++] = chk2;
 }
 
-static void umyo_get_ble_mac(uint8_t *mac)
+uint8_t ble_mac[6];
+
+int prepare_and_send_BLE()
 {
-    uint32_t unit_id = NRF_FICR->DEVICEID[1];
-    mac[0] = 212; // 0xD4
-    mac[1] = (unit_id >> 24) & 0xFF;
-    mac[2] = (unit_id >> 16) & 0xFF;
-    mac[3] = (unit_id >> 8) & 0xFF;
-    mac[4] = (unit_id) & 0xFF;
-    mac[5] = 215; // 0xD7
+    uint32_t ms = millis();
+    static int cur_adv_delay = 10;
+    static uint32_t radio_last_send_time = 0;
+    if (ms - radio_last_send_time < cur_adv_delay)
+        return 0;
+    radio_last_send_time = ms;
+
+    uint8_t rnd = adc_buffer[adc_buf_pos] & 0xFF;
+    cur_adv_delay = 2 + (rnd % 8);
+
+    uint8_t adv_addr[6];
+    umyo_get_ble_mac(adv_addr);
+
+    int bat_mv = adc_read_battery();
+    if (bat_mv < 2000)
+        battery_level = 0;
+    else
+        battery_level = (bat_mv - 2000) / 10;
+    if (bat_mv > 4500)
+        battery_level = 255;
+
+    uint8_t pdu_data[40];
+    uint8_t data[40];
+    uint8_t pdu[40];
+    int pp = 0;
+    for (int x = 0; x < 6; x++)
+        pdu_data[pp++] = adv_addr[x];
+
+    sBLE_flags flags;
+    flags.value = 0x06; // LE General Discoverable + BR/EDR Not Supported
+    data[0] = flags.value;
+    pp = ble_add_field_to_pdu(pdu_data, pp, data, 1, PDU_FLAGS);
+
+    int nlen = sprintf((char *)data, "uMyoG");
+    pp = ble_add_field_to_pdu(pdu_data, pp, data, nlen, PDU_SHORT_NAME);
+
+    ble_set_connection_mode(1);
+    int len = ble_prepare_adv_pdu(pdu, pp, pdu_data, BLE_ADV_IND_TYPE, 0, 1);
+    if (len <= 0 || len > 40)
+        return 0;
+
+    ble_send_advertisement_packet(len, pdu, 37);
+    ble_send_advertisement_packet(len, pdu, 38);
+    ble_send_advertisement_packet(len, pdu, 39);
+
+    return 1;
 }
 
 static int umyo_build_telem_payload(uint8_t *out, int max_len)
@@ -390,447 +386,7 @@ static int umyo_build_telem_payload(uint8_t *out, int max_len)
     out[dpos++] = qwy >> 8;
     out[dpos++] = qwz >> 8;
 
-    return dpos; // 15
-}
-
-static void umyo_name_ch_update(void)
-{
-    int nlen = 0;
-    while (nlen < 15 && g_device_name[nlen])
-        nlen++;
-    for (int i = 0; i < nlen; i++)
-        umyo_name_ch.value[i] = (uint8_t)g_device_name[i];
-    umyo_name_ch.value[nlen] = 0;
-    umyo_name_ch.val_length = nlen + 1;
-}
-
-static void umyo_ble_fill_services(void)
-{
-    if (ble_services_ready)
-        return;
-
-    memset(&umyo_service, 0, sizeof(umyo_service));
-    memset(&umyo_telem_ch, 0, sizeof(umyo_telem_ch));
-
-    umyo_service.handle = 0x30;
-    umyo_service.type = UUID_PRIMARY_SERVICE;
-    umyo_service.group_end = 0x3F;
-    umyo_service.uuid_16 = 0;
-    ble_uuid_from_text(umyo_service.uuid_128, "93375900-F229-8B49-B397-44B5899B8601");
-    ble_add_service(&umyo_service);
-
-    umyo_telem_ch.handle = 0x31;
-    umyo_telem_ch.value_handle = 0x32;
-    umyo_telem_ch.uuid_16 = 0;
-    ble_uuid_from_text(umyo_telem_ch.uuid_128, "FC7A850D-C1A5-F61F-0DA7-9995621FBD01");
-
-    umyo_telem_ch.val_type = VALUE_TYPE_STRUCT;
-    umyo_telem_ch.val_length = 0;
-    umyo_telem_ch.properties = CHARACTERISTIC_READ | CHARACTERISTIC_NOTIFY;
-
-    umyo_telem_ch.descriptor_count = 1;
-    umyo_telem_ch.descriptor_uuids[0] = 0x2902; // CCCD
-    umyo_telem_ch.descriptor_handles[0] = 0x33;
-    umyo_telem_ch.descriptor_values[0] = 0;
-
-    ble_add_characteristic(&umyo_telem_ch);
-
-    umyo_name_ch.handle = 0x34;
-    umyo_name_ch.value_handle = 0x35;
-    umyo_name_ch.uuid_16 = 0;
-    ble_uuid_from_text(umyo_name_ch.uuid_128, "FC7A850D-C1A5-F61F-0DA7-9995621FBD02");
-
-    umyo_name_ch.val_type = VALUE_TYPE_UTF8;
-    umyo_name_ch.properties = CHARACTERISTIC_READ | CHARACTERISTIC_WRITE_NO_RESP | CHARACTERISTIC_NOTIFY;
-
-    umyo_name_ch.descriptor_count = 1;
-    umyo_name_ch.descriptor_uuids[0] = 0x2902; // CCCD
-    umyo_name_ch.descriptor_handles[0] = 0x36;
-    umyo_name_ch.descriptor_values[0] = 0;
-
-    ble_add_characteristic(&umyo_name_ch);
-    umyo_name_ch_update();
-
-    umyo_service.char_idx[0] = umyo_telem_ch.mem_idx;
-    umyo_service.char_idx[1] = umyo_name_ch.mem_idx;
-    umyo_service.char_count = 2;
-
-    ble_services_ready = 1;
-}
-
-static int append_quat_le_i16(uint8_t *out, int pos, int max_len)
-{
-    int16_t qww, qwx, qwy, qwz;
-    lsm_get_quat_packed(&qww, &qwx, &qwy, &qwz);
-
-    if (pos + 8 > max_len)
-        return pos;
-
-    out[pos++] = qww & 0xFF;
-    out[pos++] = (qww >> 8) & 0xFF;
-    out[pos++] = qwx & 0xFF;
-    out[pos++] = (qwx >> 8) & 0xFF;
-    out[pos++] = qwy & 0xFF;
-    out[pos++] = (qwy >> 8) & 0xFF;
-    out[pos++] = qwz & 0xFF;
-    out[pos++] = (qwz >> 8) & 0xFF;
-
-    return pos;
-}
-
-static void dbg_dump_ble_phone_state(void)
-{
-    printf("tick=%lu no_conn=%lu cccd_off=%lu busy=%lu s1_need3=%lu old_need=%lu s1_pkt=%lu old_pkt=%lu pushed=%lu sent=%lu drops=%lu qmax=%u qcount=%u profile=%u\r\n",
-           (unsigned long)dbg_tick_calls,
-           (unsigned long)dbg_ret_no_conn,
-           (unsigned long)dbg_ret_cccd_off,
-           (unsigned long)dbg_ret_notify_busy,
-           (unsigned long)dbg_ret_s1_need_more,
-           (unsigned long)dbg_ret_old_need_more,
-           (unsigned long)dbg_s1_packets,
-           (unsigned long)dbg_old_packets,
-           (unsigned long)dbg_raw_chunks_pushed,
-           (unsigned long)dbg_raw_chunks_sent,
-           (unsigned long)dbg_raw_queue_drops,
-           (unsigned)dbg_raw_q_max,
-           (unsigned)g_raw_q_count,
-           (unsigned)g_phone_profile);
-}
-
-static int build_aux26_payload(uint8_t *out, int max_len)
-{
-    int16_t ax, ay, az, gx, gy, gz;
-    int16_t mx, my, mz;
-    int16_t qww, qwx, qwy, qwz;
-
-    if (max_len < 26)
-        return 0;
-
-    lsm_get_quat_packed(&qww, &qwx, &qwy, &qwz);
-    lsm_get_acc(&ax, &ay, &az);
-    lsm_get_W(&gx, &gy, &gz);
-    qmc_get_mag(&mx, &my, &mz);
-
-    int pos = 0;
-
-    out[pos++] = ax & 0xFF;
-    out[pos++] = (ax >> 8) & 0xFF;
-    out[pos++] = ay & 0xFF;
-    out[pos++] = (ay >> 8) & 0xFF;
-    out[pos++] = az & 0xFF;
-    out[pos++] = (az >> 8) & 0xFF;
-    out[pos++] = gx & 0xFF;
-    out[pos++] = (gx >> 8) & 0xFF;
-    out[pos++] = gy & 0xFF;
-    out[pos++] = (gy >> 8) & 0xFF;
-    out[pos++] = gz & 0xFF;
-    out[pos++] = (gz >> 8) & 0xFF;
-
-    out[pos++] = mx & 0xFF;
-    out[pos++] = (mx >> 8) & 0xFF;
-    out[pos++] = my & 0xFF;
-    out[pos++] = (my >> 8) & 0xFF;
-    out[pos++] = mz & 0xFF;
-    out[pos++] = (mz >> 8) & 0xFF;
-
-    out[pos++] = qww & 0xFF;
-    out[pos++] = (qww >> 8) & 0xFF;
-    out[pos++] = qwx & 0xFF;
-    out[pos++] = (qwx >> 8) & 0xFF;
-    out[pos++] = qwy & 0xFF;
-    out[pos++] = (qwy >> 8) & 0xFF;
-    out[pos++] = qwz & 0xFF;
-    out[pos++] = (qwz >> 8) & 0xFF;
-
-    return pos; // 26
-}
-
-static int umyo_ble_conn_tick(uint32_t now_ms)
-{
-    dbg_tick_calls++;
-
-    if (!ble_get_conn_state())
-    {
-        dbg_ret_no_conn++;
-        return 0;
-    }
-
-    if (umyo_telem_ch.descriptor_values[0] == 0)
-    {
-        dbg_ret_cccd_off++;
-        return 0; // CCCD not enabled
-    }
-
-    if (umyo_telem_ch.changed)
-    {
-        dbg_notify_busy_skips++;
-        dbg_ret_notify_busy++;
-        return 0; // previous notify still pending, don't overwrite it
-    }
-
-    // Connected BLE payload sizes:
-    // 52 bytes = raw3 (raw EMG only)
-    // 60 bytes = raw3 + QUAT
-    // 26 bytes = IMU + MAG + QUAT
-    //
-    // Profiles:
-    // S1 -> 60-byte notify (raw3 + QUAT)
-    // S2 -> 52-byte raw3 notify + 26-byte aux notify
-
-    if (g_phone_profile == UF1P_S1_SINGLE_LIVE)
-    {
-        // S1 packet (single-sensor live mode): raw3 + QUAT (60 bytes)
-        if (g_raw_q_count < 3)
-        {
-            dbg_ret_s1_need_more++;
-            return 0;
-        }
-
-        uint8_t tmp[60];
-        uint32_t base_tsrc = g_raw_q_tsrc[g_raw_q_tail];
-
-        tmp[0] = (base_tsrc) & 0xFF;
-        tmp[1] = (base_tsrc >> 8) & 0xFF;
-        tmp[2] = (base_tsrc >> 16) & 0xFF;
-        tmp[3] = (base_tsrc >> 24) & 0xFF;
-
-        int pos = 4;
-
-        for (int c = 0; c < 3; c++)
-        {
-            uint8_t idx = g_raw_q_tail;
-
-            for (int i = 0; i < RAW_CHUNK_SAMPLES; i++)
-            {
-                int16_t s = g_raw_q_samples[idx][i];
-                tmp[pos++] = s & 0xFF;
-                tmp[pos++] = (s >> 8) & 0xFF;
-            }
-
-            g_raw_q_tail++;
-            if (g_raw_q_tail >= RAW_CHUNK_QUEUE_LEN)
-                g_raw_q_tail = 0;
-
-            if (g_raw_q_count > 0)
-                g_raw_q_count--;
-        }
-
-        pos = append_quat_le_i16(tmp, pos, sizeof(tmp));
-
-        for (int i = 0; i < pos; i++)
-            umyo_telem_ch.value[i] = tmp[i];
-
-        umyo_telem_ch.val_length = pos; // notify payload length
-        umyo_telem_ch.changed = 1;
-        dbg_raw_chunks_sent += 3;
-        dbg_s1_packets++;
-        return 1;
-    }
-
-    if (g_phone_profile == UF1P_S2_SINGLE_ADV_CAL)
-    {
-        // S2 raw packet: raw3 only (52 bytes)
-        // S2 aux packet: IMU + MAG + QUAT (26 bytes)
-        // Aux26 deadline checked first — guarantees QUAT/IMU rate under any EMG load.
-        // EMG sends on all remaining ticks.
-        if ((now_ms - g_last_aux_send_ms) >= 40)
-        {
-            uint8_t tmp[26];
-            int pos = build_aux26_payload(tmp, sizeof(tmp));
-            if (pos == 26)
-            {
-                for (int i = 0; i < pos; i++)
-                    umyo_telem_ch.value[i] = tmp[i];
-
-                umyo_telem_ch.val_length = pos; // 26
-                umyo_telem_ch.changed = 1;
-                g_last_aux_send_ms = now_ms;
-                dbg_aux_packets_sent++;
-                return 1;
-            }
-        }
-
-        if (g_raw_q_count >= 3)
-        {
-            uint8_t tmp[52];
-            uint32_t base_tsrc = g_raw_q_tsrc[g_raw_q_tail];
-
-            tmp[0] = (base_tsrc) & 0xFF;
-            tmp[1] = (base_tsrc >> 8) & 0xFF;
-            tmp[2] = (base_tsrc >> 16) & 0xFF;
-            tmp[3] = (base_tsrc >> 24) & 0xFF;
-
-            int pos = 4;
-
-            for (int c = 0; c < 3; c++)
-            {
-                uint8_t idx = g_raw_q_tail;
-
-                for (int i = 0; i < RAW_CHUNK_SAMPLES; i++)
-                {
-                    int16_t s = g_raw_q_samples[idx][i];
-                    tmp[pos++] = s & 0xFF;
-                    tmp[pos++] = (s >> 8) & 0xFF;
-                }
-
-                g_raw_q_tail++;
-                if (g_raw_q_tail >= RAW_CHUNK_QUEUE_LEN)
-                    g_raw_q_tail = 0;
-
-                if (g_raw_q_count > 0)
-                    g_raw_q_count--;
-            }
-
-            for (int i = 0; i < pos; i++)
-                umyo_telem_ch.value[i] = tmp[i];
-
-            umyo_telem_ch.val_length = pos; // 52
-            umyo_telem_ch.changed = 1;
-            dbg_raw_chunks_sent += 3;
-            return 1;
-        }
-
-        dbg_ret_s1_need_more++;
-        return 0;
-    }
-
-    // fallback to old raw-only behavior for now for other profiles / future work
-    if (g_raw_q_count == 0)
-    {
-        dbg_ret_old_need_more++;
-        return 0;
-    }
-
-    uint8_t chunk_count = 1;
-    if (g_raw_q_count >= 3)
-        chunk_count = 3;
-    else if (g_raw_q_count >= 2)
-        chunk_count = 2;
-
-    uint8_t tmp[52];
-    uint32_t base_tsrc = g_raw_q_tsrc[g_raw_q_tail];
-
-    tmp[0] = (base_tsrc) & 0xFF;
-    tmp[1] = (base_tsrc >> 8) & 0xFF;
-    tmp[2] = (base_tsrc >> 16) & 0xFF;
-    tmp[3] = (base_tsrc >> 24) & 0xFF;
-
-    int pos = 4;
-
-    for (int c = 0; c < chunk_count; c++)
-    {
-        uint8_t idx = g_raw_q_tail;
-
-        for (int i = 0; i < RAW_CHUNK_SAMPLES; i++)
-        {
-            int16_t s = g_raw_q_samples[idx][i];
-            tmp[pos++] = s & 0xFF;
-            tmp[pos++] = (s >> 8) & 0xFF;
-        }
-
-        g_raw_q_tail++;
-        if (g_raw_q_tail >= RAW_CHUNK_QUEUE_LEN)
-            g_raw_q_tail = 0;
-
-        if (g_raw_q_count > 0)
-            g_raw_q_count--;
-    }
-
-    for (int i = 0; i < pos; i++)
-        umyo_telem_ch.value[i] = tmp[i];
-
-    umyo_telem_ch.val_length = pos;
-    umyo_telem_ch.changed = 1;
-    dbg_raw_chunks_sent += chunk_count;
-    dbg_old_packets++;
-    return 1;
-}
-
-int prepare_and_send_BLE()
-{
-    uint32_t ms = millis();
-    static int cur_adv_delay = 10;
-    static uint32_t radio_last_send_time = 0;
-    if (ms - radio_last_send_time < cur_adv_delay)
-        return 0;
-    radio_last_send_time = ms;
-
-    uint8_t rnd = adc_buffer[adc_buf_pos] & 0xFF;
-    cur_adv_delay = 2 + (rnd % 8);
-
-    uint8_t ble_mac[6];
-    umyo_get_ble_mac(ble_mac);
-
-    int bat_mv = adc_read_battery();
-    if (bat_mv < 2000)
-        battery_level = 0;
-    else
-        battery_level = (bat_mv - 2000) / 10;
-    if (bat_mv > 4500)
-        battery_level = 255;
-
-    uint8_t pdu_data[40];
-    uint8_t data[40];
-    uint8_t pdu[40];
-    int pp = 0;
-
-    for (int x = 0; x < 6; x++)
-        pdu_data[pp++] = ble_mac[x];
-
-    sBLE_flags flags;
-    flags.value = 0x06; // LE General Discoverable + BR/EDR Not Supported
-    data[0] = flags.value;
-    pp = ble_add_field_to_pdu(pdu_data, pp, data, 1, PDU_FLAGS);
-
-    int nlen = 0;
-    while (nlen < 7 && g_device_name[nlen])
-        data[nlen] = (uint8_t)g_device_name[nlen], nlen++;
-    pp = ble_add_field_to_pdu(pdu_data, pp, data, nlen, PDU_SHORT_NAME);
-
-    // 17 bytes remains for payload
-    int dpos = 0;
-    data[dpos++] = adc_data_id;
-    data[dpos++] = battery_level;
-    for (int x = 0; x < 4; x++)
-    {
-        int16_t send_v = cur_spectr[x];
-        if (x == 0)
-        {
-            data[dpos++] = send_v >> 8;
-            int mlvl = 0;
-            if (avg_muscle_level > 20)
-                mlvl = sqrt(10 * (avg_muscle_level - 20));
-            if (mlvl > 255)
-                mlvl = 255;
-            data[dpos++] = mlvl;
-        }
-        else
-        {
-            data[dpos++] = send_v >> 8;
-            data[dpos++] = send_v & 0xFF;
-        }
-    }
-
-    int16_t qww, qwx, qwy, qwz;
-    lsm_get_quat_packed(&qww, &qwx, &qwy, &qwz);
-    data[dpos++] = qww >> 8;
-    data[dpos++] = qww & 0xFF;
-    data[dpos++] = qwx >> 8;
-    data[dpos++] = qwy >> 8;
-    data[dpos++] = qwz >> 8;
-    pp = ble_add_field_to_pdu(pdu_data, pp, data, dpos, PDU_MANUFACTURER_SPEC);
-
-    static int adv_ch = 37; // cycle through advertising channels
-
-    ble_set_connection_mode(1);
-    int len = ble_prepare_adv_pdu(pdu, pp, pdu_data, BLE_ADV_IND_TYPE, 0, 1);
-    ble_send_advertisement_packet(len, pdu, adv_ch);
-
-    adv_ch++;
-    if (adv_ch > 39)
-        adv_ch = 37;
-
-    return 1;
+    return dpos; // should be 15
 }
 
 int16_t emg_raw[16];
@@ -858,41 +414,6 @@ int push_adc_data()
 {
     if (adc_get_data(emg_raw, emg_sp_data))
     {
-        // Queue the latest 8 raw EMG samples for BLE GATT raw notify mode
-        {
-            uint8_t idx = g_raw_q_head;
-
-            g_raw_q_tsrc[idx] = g_raw_next_sample;
-            for (int i = 0; i < RAW_CHUNK_SAMPLES; i++)
-                g_raw_q_samples[idx][i] = emg_raw[i];
-
-            g_raw_next_sample += RAW_CHUNK_SAMPLES;
-
-            uint8_t next_head = idx + 1;
-            if (next_head >= RAW_CHUNK_QUEUE_LEN)
-                next_head = 0;
-
-            if (g_raw_q_count < RAW_CHUNK_QUEUE_LEN)
-            {
-                g_raw_q_head = next_head;
-                g_raw_q_count++;
-
-                dbg_raw_chunks_pushed++;
-                if (g_raw_q_count > dbg_raw_q_max)
-                    dbg_raw_q_max = g_raw_q_count;
-            }
-            else
-            {
-                // queue full: overwrite oldest
-                dbg_raw_queue_drops++;
-
-                g_raw_q_head = next_head;
-                g_raw_q_tail++;
-                if (g_raw_q_tail >= RAW_CHUNK_QUEUE_LEN)
-                    g_raw_q_tail = 0;
-            }
-        }
-
         static float avg_emg_long = 0;
         float bufX[16];
         float bufYr[16];
@@ -979,7 +500,7 @@ int push_adc_data()
             prev_d_corr = d_corr;
             i_corr += d_corr;
             i_corr *= 0.999;
-            float c_coeff = 0.0005;
+            // float c_coeff = 0.0005f; // reserved for future correction tuning
             float dcabs = d_corr;
             if (dcabs < 0)
                 dcabs = -dcabs;
@@ -1128,6 +649,76 @@ void low_power_cycle()
     NRF_RADIO->POWER = 1;
 }
 
+static void umyo_ble_fill_services(void)
+{
+    if (ble_services_ready)
+        return;
+
+    // Primary service with a 128-bit UUID
+    umyo_service.handle = 0x30;
+    umyo_service.type = UUID_PRIMARY_SERVICE; // 0x2800
+    umyo_service.group_end = 0x3F;            // room for a few chars
+    umyo_service.uuid_16 = 0;
+    ble_uuid_from_text(umyo_service.uuid_128, "93375900-F229-8B49-B397-44B5899B8601"); // pick your final UUID later
+    ble_add_service(&umyo_service);
+
+    // Telemetry characteristic (notify + read), CCCD at handle+2
+    umyo_telem_ch.handle = 0x31;
+    umyo_telem_ch.value_handle = 0x32;
+
+    umyo_telem_ch.descriptor_count = 1;
+    umyo_telem_ch.descriptor_uuids[0] = 0x2902; // CCCD
+    umyo_telem_ch.descriptor_handles[0] = 0x33;
+    umyo_telem_ch.descriptor_values[0] = 0;
+
+    umyo_telem_ch.uuid_16 = 0;
+    ble_uuid_from_text(umyo_telem_ch.uuid_128, "FC7A850D-C1A5-F61F-0DA7-9995621FBD01");
+
+    umyo_telem_ch.val_type = VALUE_TYPE_STRUCT;
+    umyo_telem_ch.val_length = 0;
+    umyo_telem_ch.properties = CHARACTERISTIC_READ | CHARACTERISTIC_NOTIFY;
+
+    ble_add_characteristic(&umyo_telem_ch);
+
+    umyo_service.char_idx[0] = umyo_telem_ch.mem_idx;
+    umyo_service.char_count = 1;
+
+    ble_services_ready = 1;
+}
+
+static int umyo_ble_conn_tick(void)
+{
+    if (!ble_get_conn_state())
+        return 0;
+    if (umyo_telem_ch.descriptor_values[0] == 0)
+        return 0; // CCCD not enabled => can't notify
+
+    uint8_t tmp[20];
+    int n = umyo_build_telem_payload(tmp, sizeof(tmp));
+    if (n <= 0)
+        return 0;
+    if (n > 20)
+        n = 20;
+
+    for (int i = 0; i < n; i++)
+        umyo_telem_ch.value[i] = tmp[i];
+    umyo_telem_ch.val_length = n;
+    umyo_telem_ch.changed = 1;
+
+    return 1; // queued notify (will be sent by BLE ATT process)
+}
+
+static void umyo_get_ble_mac(uint8_t *mac)
+{
+    uint32_t unit_id = NRF_FICR->DEVICEID[1];
+    mac[0] = 212; // 0xD4
+    mac[1] = (unit_id >> 24) & 0xFF;
+    mac[2] = (unit_id >> 16) & 0xFF;
+    mac[3] = (unit_id >> 8) & 0xFF;
+    mac[4] = (unit_id) & 0xFF;
+    mac[5] = 215; // 0xD7
+}
+
 enum
 {
     radio_mode_fast32 = 0,
@@ -1144,47 +735,22 @@ void switch_to_ble()
     schedule_event_stop();
     rf_dettach_rx_irq();
     rf_dettach_tx_irq();
+
     NRF_RADIO->POWER = 0;
     delay_ms(2);
-
-    g_phone_profile = UF1P_S2_SINGLE_ADV_CAL;
-
-    g_raw_q_head = 0;
-    g_raw_q_tail = 0;
-    g_raw_q_count = 0;
-    g_raw_next_sample = 0;
-
-    dbg_raw_chunks_pushed = 0;
-    dbg_raw_chunks_sent = 0;
-    dbg_raw_queue_drops = 0;
-    dbg_notify_busy_skips = 0;
-    dbg_raw_q_max = 0;
-
-    dbg_tick_calls = 0;
-    dbg_ret_no_conn = 0;
-    dbg_ret_cccd_off = 0;
-    dbg_ret_notify_busy = 0;
-    dbg_ret_s1_need_more = 0;
-    dbg_ret_old_need_more = 0;
-    dbg_s1_packets = 0;
-    dbg_old_packets = 0;
-
-    dbg_aux_packets_sent = 0;
-    g_last_aux_send_ms = 0;
 
     ble_services_ready = 0;
     memset(&umyo_service, 0, sizeof(umyo_service));
     memset(&umyo_telem_ch, 0, sizeof(umyo_telem_ch));
-    memset(&umyo_name_ch, 0, sizeof(umyo_name_ch));
 
     ble_init_radio();
-    ble_update_our_mtu(64);
 
     uint8_t mac[6];
     umyo_get_ble_mac(mac);
     ble_set_our_mac(mac);
 
-    umyo_ble_fill_services();
+    // keep this OFF for one visibility test
+    // umyo_ble_fill_services();
 
     for (int x = 0; x < 3; x++)
     {
@@ -1379,24 +945,6 @@ int main(void)
     //	star_init(21, 1000, 2000, 0);
 
     dev_state = read_current_state();
-
-    dev_name_read(g_device_name);
-    if (g_device_name[0] == '\0')
-    {
-        // Generate default name from last 2 variable MAC bytes
-        uint8_t mac[6];
-        umyo_get_ble_mac(mac);
-        int pos = 0;
-        const char *prefix = "uMyo-";
-        while (*prefix) g_device_name[pos++] = *prefix++;
-        const char hex[] = "0123456789ABCDEF";
-        g_device_name[pos++] = hex[(mac[3] >> 4) & 0xF];
-        g_device_name[pos++] = hex[mac[3] & 0xF];
-        g_device_name[pos++] = hex[(mac[4] >> 4) & 0xF];
-        g_device_name[pos++] = hex[mac[4] & 0xF];
-        g_device_name[pos] = '\0';
-    }
-
     if (dev_state.fields.radio_mode == radio_mode_ble)
         radio_mode = radio_mode_ble;
     if (dev_state.fields.radio_mode == radio_mode_fast32)
@@ -1601,49 +1149,16 @@ int main(void)
         {
             if (!ble_get_conn_state())
             {
-                g_name_sent_this_conn = 0;
+                prepare_and_send_BLE();
+            }
+            else
+            {
                 if (unsent_cnt > 0)
                 {
-                    if (prepare_and_send_BLE())
+                    if (umyo_ble_conn_tick())
                         unsent_cnt = 0;
                 }
             }
-            // Connected BLE streaming must tick unconditionally while GATT is active.
-            // Do not gate this by unsent_cnt: connected mode uses notify flow, and
-            // gating here can make notifications appear enabled while no data is sent.
-            else
-            {
-                // Persist name written by Android
-                if (umyo_name_ch.had_write)
-                {
-                    char new_name[16];
-                    __disable_irq();
-                    for (int i = 0; i < 16; i++)
-                        new_name[i] = (char)umyo_name_ch.value[i];
-                    __enable_irq();
-                    umyo_name_ch.had_write = 0;
-                    new_name[15] = '\0';
-                    // Require at least one printable ASCII character
-                    if ((uint8_t)new_name[0] >= 0x20 && (uint8_t)new_name[0] <= 0x7E)
-                    {
-                        for (int i = 0; i < 16; i++)
-                            g_device_name[i] = new_name[i];
-                        dev_name_write(g_device_name);
-                        umyo_name_ch_update();
-                    }
-                }
-
-                // One-shot: notify name to Android on first connection
-                if (umyo_name_ch.descriptor_values[0] && !g_name_sent_this_conn && !umyo_name_ch.changed)
-                {
-                    umyo_name_ch_update();
-                    umyo_name_ch.changed = 1;
-                    g_name_sent_this_conn = 1;
-                }
-
-                umyo_ble_conn_tick(ms);
-            }
         }
-        //		if((ms%1000) == 499) leds_pulse(0, 255*(!had_adc), 255*had_adc, 10), had_adc = 0;
     }
 }
